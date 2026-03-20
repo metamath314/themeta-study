@@ -9,17 +9,17 @@ import uuid
 import hmac
 import hashlib
 
-# --- [비밀 설정] 금고에서 가져오기 ---
+# --- [1. 보안 설정: Secrets에서 불러오기] ---
 try:
     GCP_CREDS = json.loads(st.secrets["gcp_service_account"])
     SOLAPI_KEY = st.secrets["solapi_api_key"]
     SOLAPI_SECRET = st.secrets["solapi_api_secret"]
     SENDER_PHONE = st.secrets["sender_phone"]
 except Exception as e:
-    st.error("보안 금고(Secrets) 설정이 필요합니다. 데모 모드로 작동합니다.")
+    st.error("보안 설정(Secrets)이 완료되지 않았습니다. 관리자 설정을 확인하세요.")
     GCP_CREDS = None
 
-# --- [설정] 구글 시트 연동 ---
+# --- [2. 구글 시트 초기화] ---
 @st.cache_resource(ttl=600)
 def init_sheet(creds_data):
     if not creds_data: return None, None
@@ -30,26 +30,33 @@ def init_sheet(creds_data):
         spreadsheet = client.open("themeta_db")
         return spreadsheet.worksheet("Students_DB"), spreadsheet.worksheet("Attendance_Log")
     except Exception as e:
+        st.error(f"구글 시트 연결 실패: {e}")
         return None, None
 
 student_sh, log_sh = init_sheet(GCP_CREDS)
 
-# --- [설정] 솔라피 문자 발송 ---
+# --- [3. 솔라피 문자 발송 함수 (보안 및 번호 보정 강화)] ---
 def send_notification(student_name, total_minutes, parent_phone):
     if not GCP_CREDS or SOLAPI_KEY == "원장님의_솔라피_API_KEY": 
         return False
     
+    # [번호 보정] 0이 빠졌거나 하이픈이 있는 경우 처리
+    phone = str(parent_phone).replace('-', '').strip()
+    if phone.startswith('10') and len(phone) == 10:
+        phone = '0' + phone
+    
+    # API 인증용 시그니처 생성
     date = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     salt = str(uuid.uuid4().hex)
     signature = hmac.new(SOLAPI_SECRET.encode(), (date + salt).encode(), hashlib.sha256).hexdigest()
     auth_str = f'HMAC-SHA256 apiKey={SOLAPI_KEY}, date={date}, salt={salt}, signature={signature}'
     
     headers = {'Authorization': auth_str, 'Content-Type': 'application/json'}
-    text_content = f"[{student_name} 학생 하원 알림]\n오늘 더메타 수학학원에서 총 {total_minutes}분 동안 집중하여 자습을 완료했습니다. 따뜻한 격려 부탁드립니다! 👏"
+    text_content = f"[{student_name} 학생 하원]\n오늘 총 {total_minutes}분간 자습을 성실히 마쳤습니다. 격려 부탁드립니다! - 더메타 수학학원"
     
     data = {
         'message': {
-            'to': str(parent_phone).replace('-', ''),
+            'to': phone,
             'from': str(SENDER_PHONE).replace('-', ''),
             'text': text_content
         }
@@ -60,104 +67,123 @@ def send_notification(student_name, total_minutes, parent_phone):
     except:
         return False
 
-# --- [상태 관리] 누적 시간 및 로그인 상태 유지 ---
+# --- [4. 앱 상태 관리 변수 설정] ---
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'is_studying' not in st.session_state: st.session_state.is_studying = False
 if 'accumulated_seconds' not in st.session_state: st.session_state.accumulated_seconds = 0
 if 'start_time' not in st.session_state: st.session_state.start_time = None
 
-# --- [UI 디자인] ---
+# --- [5. UI 디자인] ---
 st.set_page_config(page_title="더메타 스마트 자습실", layout="wide")
-st.markdown("""<style>.main { background-color: #f8f9fa; } .stButton>button { width:100%; border-radius:10px; height:3em; font-weight:bold; }</style>""", unsafe_allow_html=True)
+st.markdown("""
+    <style>
+    .main { background-color: #f8f9fa; }
+    .stButton>button { width:100%; border-radius:12px; height:3.5em; font-weight:bold; font-size: 1.1em; }
+    .status-box { padding: 20px; border-radius: 15px; margin-bottom: 20px; text-align: center; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- [메인 화면] ---
+# --- [6. 메인 로직] ---
 st.title("🏛️ 더메타 수학학원 : AI 스마트 자습실")
 
-col1, col2 = st.columns([2, 1])
+col1, col2 = st.columns([1.5, 1])
 
 with col1:
-    with st.container():
-        # [1단계: 로그인 화면]
-        if not st.session_state.logged_in:
-            st.subheader("👋 출석체크 (로그인)")
-            student_name = st.text_input("학생 이름 입력", placeholder="예: 김응수")
-            if st.button("🔑 로그인"):
-                if not student_name:
-                    st.warning("이름을 입력해주세요.")
-                elif student_sh:
+    # [A. 로그인 화면: 부정행위 방지 위해 이름+ID 체크]
+    if not st.session_state.logged_in:
+        st.subheader("🔐 학생 인증 로그인")
+        with st.form("login_form"):
+            input_name = st.text_input("학생 이름", placeholder="이름 입력")
+            input_id = st.text_input("고유 ID (비밀번호)", type="password", placeholder="숫자 4자리")
+            submit = st.form_submit_button("🔑 자습실 입장")
+            
+            if submit:
+                if student_sh:
                     df = pd.DataFrame(student_sh.get_all_records())
-                    student = df[df['이름'] == student_name]
+                    # 이름과 고유ID(숫자)가 모두 일치하는 행 탐색
+                    student = df[(df['이름'] == input_name) & (df['고유ID'].astype(str) == input_id)]
+                    
                     if not student.empty:
                         st.session_state.logged_in = True
                         st.session_state.current_student = student.iloc[0]
                         st.session_state.accumulated_seconds = 0
-                        st.rerun() # 화면 새로고침
+                        st.rerun()
                     else:
-                        st.error("등록된 학생이 아닙니다.")
+                        st.error("⚠️ 이름 또는 고유 ID가 올바르지 않습니다.")
+                else:
+                    st.error("데이터베이스 연결에 문제가 있습니다.")
+
+    # [B. 자습 관리 화면: 일시정지 및 누적 시간]
+    else:
+        student = st.session_state.current_student
+        st.success(f"🎓 **{student['이름']}** 학생, 오늘 공부를 응원합니다!")
         
-        # [2단계: 자습 관리 화면 (로그인 성공 후)]
+        # 현재 누적된 시간 계산 (분 단위 표시용)
+        current_acc = st.session_state.accumulated_seconds
+        if st.session_state.is_studying:
+            current_acc += (datetime.now() - st.session_state.start_time).total_seconds()
+        
+        display_min = round(current_acc / 60, 1)
+        st.metric("현재까지 누적 자습 시간", f"{display_min} 분")
+
+        st.divider()
+
+        c1, c2 = st.columns(2)
+        
+        # 1. 시작 및 재개
+        if not st.session_state.is_studying:
+            if c1.button("▶️ 자습 시작 / 다시 시작"):
+                st.session_state.is_studying = True
+                st.session_state.start_time = datetime.now()
+                st.rerun()
+        # 2. 일시 정지 (누적치 저장)
         else:
-            student = st.session_state.current_student
-            st.success(f"🎓 **{student['이름']}** 학생, 환영합니다!")
-            
-            # 현재 상태 표시
-            if st.session_state.is_studying:
-                st.info("🔥 현재 집중해서 자습 중입니다!")
-            else:
-                st.warning("☕ 현재 휴식 중이거나 자습 대기 상태입니다.")
-            
-            c1, c2, c3 = st.columns(3)
-            
-            # [시작/재개 버튼]
-            if not st.session_state.is_studying:
-                if c1.button("▶️ 자습 시작"):
-                    st.session_state.is_studying = True
-                    st.session_state.start_time = datetime.now()
-                    st.rerun()
-            
-            # [일시 정지 버튼]
-            else:
-                if c2.button("⏸️ 일시 정지 (휴식)"):
-                    duration = (datetime.now() - st.session_state.start_time).total_seconds()
-                    st.session_state.accumulated_seconds += duration
-                    st.session_state.is_studying = False
-                    st.rerun()
-            
-            # [최종 하원 버튼]
-            if c3.button("⏹️ 최종 하원 (문자 전송)"):
-                # 공부 중이었다면 마지막 시간까지 더하기
+            if c1.button("⏸️ 일시 정지 (휴식/식사)"):
+                duration = (datetime.now() - st.session_state.start_time).total_seconds()
+                st.session_state.accumulated_seconds += duration
+                st.session_state.is_studying = False
+                st.rerun()
+        
+        # 3. 최종 하원 (문자 발송 및 로그 기록)
+        if c2.button("⏹️ 최종 하원 (문자 전송)"):
+            with st.spinner("하원 리포트를 부모님께 발송 중..."):
                 if st.session_state.is_studying:
                     duration = (datetime.now() - st.session_state.start_time).total_seconds()
                     st.session_state.accumulated_seconds += duration
                 
-                # 총 분(minute) 계산 (최소 1분 보장)
                 total_minutes = max(1, round(st.session_state.accumulated_seconds / 60))
                 
-                # 📱 진짜 문자 발송 (Solapi)
+                # 솔라피 실전 발송
                 success = send_notification(student['이름'], total_minutes, student['학부모전화번호'])
                 
-                # 📝 구글 시트 최종 기록
+                # 구글 시트 로그 남기기
                 if log_sh:
                     try:
                         log_sh.append_row([
                             str(student['이름']), 
                             str(student['고유ID']), 
-                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), # 하원 시간 기록
-                            "하원 완료", 
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "하원완료", 
                             f"{total_minutes}분", 
                             "Y" if success else "N"
                         ])
-                    except:
-                        pass
+                    except: pass
                 
-                # 초기화 및 축하
                 st.balloons()
+                msg = f"오늘 총 {total_minutes}분 자습 완료! 문자 발송 성공." if success else f"오늘 {total_minutes}분 자습 완료. (문자 발송 실패 - 잔액 또는 번호 확인)"
+                st.success(msg)
+                
+                # 세션 초기화 (로그아웃 효과)
                 st.session_state.logged_in = False
                 st.session_state.is_studying = False
                 st.session_state.accumulated_seconds = 0
-                st.success(f"수고하셨습니다! 오늘 총 {total_minutes}분 학습했으며, 부모님께 알림톡이 발송되었습니다.")
-                # st.rerun() 생략하여 마지막 성공 메시지 보여줌
 
 with col2:
-    st.markdown("### 📸 시스템 작동 중")
-    st.image("https://images.unsplash.com/photo-1434030216411-0b793f4b4173?w=400", use_container_width=True)
+    st.markdown("### 📢 자습실 안내")
+    st.info("""
+    1. **입장:** 본인의 이름과 고유 ID를 입력하세요.
+    2. **기록:** 자리에 앉으면 '자습 시작'을 누르세요.
+    3. **휴식:** 밥을 먹거나 쉴 때는 '일시 정지'를 누르세요.
+    4. **귀가:** 집에 갈 때 '최종 하원'을 누르면 부모님께 문자가 갑니다.
+    """)
+    st.image("https://images.unsplash.com/photo-1497633762265-9d179a990aa6?w=400", use_container_width=True)
