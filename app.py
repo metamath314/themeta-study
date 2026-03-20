@@ -34,7 +34,7 @@ def init_sheet(creds_data):
 
 student_sh, log_sh = init_sheet(GCP_CREDS)
 
-# --- [설정] 솔라피 문자 발송 (오류 없는 API 방식) ---
+# --- [설정] 솔라피 문자 발송 ---
 def send_notification(student_name, total_minutes, parent_phone):
     if not GCP_CREDS or SOLAPI_KEY == "원장님의_솔라피_API_KEY": 
         return False
@@ -45,7 +45,7 @@ def send_notification(student_name, total_minutes, parent_phone):
     auth_str = f'HMAC-SHA256 apiKey={SOLAPI_KEY}, date={date}, salt={salt}, signature={signature}'
     
     headers = {'Authorization': auth_str, 'Content-Type': 'application/json'}
-    text_content = f"[{student_name} 학생 자습 완료]\n오늘 총 {total_minutes}분 동안 집중하여 학습을 마쳤습니다. - 더메타 수학학원"
+    text_content = f"[{student_name} 학생 하원 알림]\n오늘 더메타 수학학원에서 총 {total_minutes}분 동안 집중하여 자습을 완료했습니다. 따뜻한 격려 부탁드립니다! 👏"
     
     data = {
         'message': {
@@ -60,89 +60,104 @@ def send_notification(student_name, total_minutes, parent_phone):
     except:
         return False
 
+# --- [상태 관리] 누적 시간 및 로그인 상태 유지 ---
+if 'logged_in' not in st.session_state: st.session_state.logged_in = False
+if 'is_studying' not in st.session_state: st.session_state.is_studying = False
+if 'accumulated_seconds' not in st.session_state: st.session_state.accumulated_seconds = 0
+if 'start_time' not in st.session_state: st.session_state.start_time = None
+
 # --- [UI 디자인] ---
 st.set_page_config(page_title="더메타 스마트 자습실", layout="wide")
 st.markdown("""<style>.main { background-color: #f8f9fa; } .stButton>button { width:100%; border-radius:10px; height:3em; font-weight:bold; }</style>""", unsafe_allow_html=True)
 
-# --- [비즈니스 로직] ---
-def get_student_info(name):
-    if not student_sh: return None
-    df = pd.DataFrame(student_sh.get_all_records())
-    student = df[df['이름'] == name]
-    if not student.empty:
-        return student.iloc[0]
-    return None
-
 # --- [메인 화면] ---
 st.title("🏛️ 더메타 수학학원 : AI 스마트 자습실")
-st.subheader("오늘의 학습 기록을 시작하세요.")
 
 col1, col2 = st.columns([2, 1])
 
 with col1:
     with st.container():
-        st.info("이름을 입력하고 로그인 버튼을 눌러주세요.")
-        student_name = st.text_input("학생 이름 입력", placeholder="예: 김응수")
+        # [1단계: 로그인 화면]
+        if not st.session_state.logged_in:
+            st.subheader("👋 출석체크 (로그인)")
+            student_name = st.text_input("학생 이름 입력", placeholder="예: 김응수")
+            if st.button("🔑 로그인"):
+                if not student_name:
+                    st.warning("이름을 입력해주세요.")
+                elif student_sh:
+                    df = pd.DataFrame(student_sh.get_all_records())
+                    student = df[df['이름'] == student_name]
+                    if not student.empty:
+                        st.session_state.logged_in = True
+                        st.session_state.current_student = student.iloc[0]
+                        st.session_state.accumulated_seconds = 0
+                        st.rerun() # 화면 새로고침
+                    else:
+                        st.error("등록된 학생이 아닙니다.")
         
-        c1, c2 = st.columns(2)
-        
-        if c1.button("🔑 로그인 및 자습 시작"):
-            if not student_name:
-                st.warning("이름을 입력해주세요.")
+        # [2단계: 자습 관리 화면 (로그인 성공 후)]
+        else:
+            student = st.session_state.current_student
+            st.success(f"🎓 **{student['이름']}** 학생, 환영합니다!")
+            
+            # 현재 상태 표시
+            if st.session_state.is_studying:
+                st.info("🔥 현재 집중해서 자습 중입니다!")
             else:
-                student_info = get_student_info(student_name)
-                if student_info is not None:
-                    st.session_state.start = datetime.now()
-                    st.session_state.current_student = student_info
-                    st.success(f"[{student_name}]님, 어서오세요! 자습 기록이 시작되었습니다.")
-                    
-                    # ★문제 해결: 모든 정보를 문자로 바꿔서 튕김 현상 원천 차단★
-                    if log_sh:
-                        try:
-                            log_sh.append_row([
-                                str(student_name), 
-                                str(student_info['고유ID']), 
-                                st.session_state.start.strftime("%Y-%m-%d %H:%M:%S"), 
-                                "진행중", 
-                                "0", 
-                                "N"
-                            ])
-                        except Exception as e:
-                            st.error(f"구글 시트 기록 중 오류 발생: {e}")
-                else:
-                    st.error("등록된 학생이 아닙니다. 학원에 문의하세요.")
-
-        if c2.button("⏹️ 자습 종료 및 리포트 발송"):
-            if 'start' in st.session_state and 'current_student' in st.session_state:
-                st.session_state.end = datetime.now()
-                duration = st.session_state.end - st.session_state.start
-                total_minutes = max(1, round(duration.total_seconds() / 60)) # 최소 1분 보장
+                st.warning("☕ 현재 휴식 중이거나 자습 대기 상태입니다.")
+            
+            c1, c2, c3 = st.columns(3)
+            
+            # [시작/재개 버튼]
+            if not st.session_state.is_studying:
+                if c1.button("▶️ 자습 시작"):
+                    st.session_state.is_studying = True
+                    st.session_state.start_time = datetime.now()
+                    st.rerun()
+            
+            # [일시 정지 버튼]
+            else:
+                if c2.button("⏸️ 일시 정지 (휴식)"):
+                    duration = (datetime.now() - st.session_state.start_time).total_seconds()
+                    st.session_state.accumulated_seconds += duration
+                    st.session_state.is_studying = False
+                    st.rerun()
+            
+            # [최종 하원 버튼]
+            if c3.button("⏹️ 최종 하원 (문자 전송)"):
+                # 공부 중이었다면 마지막 시간까지 더하기
+                if st.session_state.is_studying:
+                    duration = (datetime.now() - st.session_state.start_time).total_seconds()
+                    st.session_state.accumulated_seconds += duration
                 
-                student = st.session_state.current_student
+                # 총 분(minute) 계산 (최소 1분 보장)
+                total_minutes = max(1, round(st.session_state.accumulated_seconds / 60))
+                
+                # 📱 진짜 문자 발송 (Solapi)
                 success = send_notification(student['이름'], total_minutes, student['학부모전화번호'])
                 
+                # 📝 구글 시트 최종 기록
                 if log_sh:
                     try:
                         log_sh.append_row([
                             str(student['이름']), 
                             str(student['고유ID']), 
-                            st.session_state.start.strftime("%Y-%m-%d %H:%M:%S"), 
-                            st.session_state.end.strftime("%Y-%m-%d %H:%M:%S"), 
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), # 하원 시간 기록
+                            "하원 완료", 
                             f"{total_minutes}분", 
                             "Y" if success else "N"
                         ])
-                    except Exception as e:
-                        st.error(f"종료 기록 중 오류: {e}")
+                    except:
+                        pass
                 
+                # 초기화 및 축하
                 st.balloons()
-                st.success(f"수고했어요! {total_minutes}분 동안 학습을 마쳤습니다. (문자 발송: {'대기/성공' if success else '테스트모드'})")
-                
-                del st.session_state.start
-                del st.session_state.current_student
-            else:
-                st.warning("먼저 로그인 및 시작 버튼을 눌러주세요.")
+                st.session_state.logged_in = False
+                st.session_state.is_studying = False
+                st.session_state.accumulated_seconds = 0
+                st.success(f"수고하셨습니다! 오늘 총 {total_minutes}분 학습했으며, 부모님께 알림톡이 발송되었습니다.")
+                # st.rerun() 생략하여 마지막 성공 메시지 보여줌
 
 with col2:
-    st.markdown("### 🏆 오늘의 자습 현황")
-    st.write("실시간 연동 준비 완료")
-    st.image("https://images.unsplash.com/photo-1434030216411-0b793f4b4173?w=400", use_container_width=True, caption="스마트 브레인 시스템")
+    st.markdown("### 📸 시스템 작동 중")
+    st.image("https://images.unsplash.com/photo-1434030216411-0b793f4b4173?w=400", use_container_width=True)
